@@ -78,6 +78,7 @@ class SparseGPT:
         Hinv = H
 
         mask = None
+        result_mask = torch.zeros_like(W)
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
@@ -124,6 +125,7 @@ class SparseGPT:
 
             W[:, i1:i2] = Q1
             Losses += torch.sum(Losses1, 1) / 2
+            result_mask[:, i1:i2] = mask1
 
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
@@ -142,6 +144,7 @@ class SparseGPT:
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         if DEBUG:
             print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
+        return result_mask
 
     def free(self):
         if DEBUG:
