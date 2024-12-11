@@ -79,6 +79,8 @@ def opt_sequential(model, dataloader, dev):
 
     print('Ready.')
 
+    masks = {}
+
     for i in range(len(layers)):
         layer = layers[i].to(dev)
 
@@ -111,9 +113,10 @@ def opt_sequential(model, dataloader, dev):
             print(i, name)
             print('Pruning ...')
             sparsity = args.sparsity
-            gpts[name].fasterprune(
+            pruning_mask = gpts[name].fasterprune(
                 sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
             )
+            masks[subset[name]] = pruning_mask
             gpts[name].free()
 
         for j in range(args.nsamples):
@@ -126,6 +129,7 @@ def opt_sequential(model, dataloader, dev):
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
+    return masks
 
 @torch.no_grad()
 def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
