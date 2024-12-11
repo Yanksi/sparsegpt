@@ -144,6 +144,8 @@ class SparseGPT:
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         if DEBUG:
             print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
+        result_mask = 1 - result_mask
+        self.layer.register_buffer('mask', result_mask)
         return result_mask
 
     def free(self):
