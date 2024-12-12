@@ -37,7 +37,7 @@ def opt_sequential(model, dataloader, dev):
     layers = model.model.decoder.layers
 
     model = model.to(dev)
-    linear_layers = get_layers_with_type(layers, nn.Linear)
+    linear_layers = get_layers_with_type(layers, nn.Linear, prefix='model.decoder.layers.')
     linear_to_names = get_layer_to_names(linear_layers)
 
     sparse_gpts = {}
@@ -56,6 +56,7 @@ def opt_sequential(model, dataloader, dev):
         model(batch[0].to(dev))
     handle.remove()
 
+    masks = {}
     print("Pruning ...")
     for l, s in sparse_gpts.items():
         print(linear_to_names[l][0] if len(linear_to_names[l]) == 1 else linear_to_names[l])
@@ -64,8 +65,10 @@ def opt_sequential(model, dataloader, dev):
             sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
         )
         s.free()
+        masks[linear_to_names[l][0]] = pruning_mask
 
     model.config.use_cache = use_cache
+    return masks
 
 @torch.no_grad()
 def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
@@ -262,12 +265,13 @@ if __name__ == '__main__':
 
     if (args.sparsity or args.prunen) and not args.gmp:
         tick = time.time()
-        opt_sequential(model, dataloader, DEV)
+        masks = opt_sequential(model, dataloader, DEV)
         for n, p in model.model.decoder.layers.named_parameters():
             print(n, torch.mean((p == 0).float()))
             # if 'fc2' in n:
             #     break
         print(time.time() - tick)
+        torch.save(masks, f'{args.save}/masks.pt')
 
     for dataset in ['wikitext2', 'ptb', 'c4']:
         dataloader, testloader = get_loaders(
