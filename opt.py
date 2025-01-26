@@ -315,7 +315,7 @@ if __name__ == '__main__':
     # init W&B logging
     if args.log_wandb:
         assert has_wandb, "wandb not installed try `pip install wandb`"
-        wandb.init(config=args)
+        wandb.init(project="prune", name="OPT", config=args)
 
     model = get_opt(args.model)
     model.eval()

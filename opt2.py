@@ -8,6 +8,7 @@ from sparsegpt import *
 from modelutils import *
 
 from sparselinear.util import *
+import pathlib
 
 try:
     import wandb
@@ -71,107 +72,52 @@ def opt_sequential(model, dataloader, dev):
     return masks
 
 @torch.no_grad()
-def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
+def opt_gmp(model, target_sparsity):
+    print("Starting ...")
+    layers = model.model.decoder.layers
+    linear_layers = get_layers_with_type(layers, nn.Linear, prefix='model.decoder.layers.')
+    masks = {}
+    for n, l in linear_layers.items():
+        W = l.weight
+        thresh = torch.sort(torch.abs(W.flatten()))[0][int(W.numel() * target_sparsity)]
+        masks[n] = torch.abs(W) > thresh
+        W.data[torch.abs(W.data) <= thresh] = 0
+    return masks
+
+@torch.no_grad()
+def opt_eval(model, testenc, dev):
     print('Evaluating ...')
 
     testenc = testenc.input_ids
     nsamples = testenc.numel() // model.seqlen
 
+    model = model.to(dev)
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    layers = model.model.decoder.layers
 
-    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
-    model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
-    if hasattr(model.model.decoder, 'project_out') and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(dev) 
-    if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.to(dev) 
-    layers[0] = layers[0].to(dev)
-
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros(
-        (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
-    )
-    cache = {'i': 0, 'attention_mask': None}
-
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-        def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            raise ValueError
-    layers[0] = Catcher(layers[0])
-    for i in range(nsamples):
-        batch = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)].to(dev)
-        try:
-            model(batch)
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-
-    layers[0] = layers[0].cpu()
-    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
-    model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
-    if hasattr(model.model.decoder, 'project_out') and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.cpu()
-    if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.cpu()
-    torch.cuda.empty_cache()
-
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-
-    for i in range(len(layers)):
-        print(i)
-        layer = layers[i].to(dev)
-
-        if args.gmp:
-            subset = find_layers(layer)
-            for name in subset:
-                W = subset[name].weight.data
-                thresh = torch.sort(torch.abs(W.flatten()))[0][int(W.numel() * args.sparsity)]
-                W.data[torch.abs(W.data) <= thresh] = 0
-
-        for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-        layers[i] = layer.cpu()
-        del layer
-        torch.cuda.empty_cache()
-        inps, outs = outs, inps
-
-    if model.model.decoder.final_layer_norm is not None:
-        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
-    if model.model.decoder.project_out is not None:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(dev)
-    model.lm_head = model.lm_head.to(dev)
-
-    testenc = testenc.to(dev)
-    nlls = []
-    for i in range(nsamples):
-        hidden_states = inps[i].unsqueeze(0)
-        if model.model.decoder.final_layer_norm is not None:
-            hidden_states = model.model.decoder.final_layer_norm(hidden_states)
-        if model.model.decoder.project_out is not None:
-            hidden_states = model.model.decoder.project_out(hidden_states)
-        lm_logits = model.lm_head(hidden_states)
-        shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = testenc[
-            :, (i * model.seqlen):((i + 1) * model.seqlen)
-        ][:, 1:]
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        neg_log_likelihood = loss.float() * model.seqlen
-        nlls.append(neg_log_likelihood)
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
-    print(f"Perplexity: {ppl.item():3f}")
-    if log_wandb:
-         wandb.log({f'{dataset}/perplexity': ppl.item()})
-
+    testenc = testenc[:, :(nsamples * model.seqlen)].contiguous().reshape(nsamples, model.seqlen)
+    losses = []
+    batch_size = 16
+    for i in range(0, nsamples, batch_size):
+        batch = testenc[i:min(i + batch_size, nsamples)].to(dev)
+        losses.append(model(batch, labels=batch, return_dict=True).loss)
+    ppl = torch.exp(torch.stack(losses).mean())
     model.config.use_cache = use_cache
+    return ppl
+
+@torch.no_grad()
+def opt_eval_all(model, tag):
+    print(tag)
+    perplexities = {}
+    for dataset in ['wikitext2', 'ptb', 'c4']:
+        dataloader, testloader = get_loaders(
+            dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
+        )
+        print(dataset)
+        perplexity = opt_eval(model, testloader, DEV)
+        print(f"Perplexity: {perplexity.item():3f}")
+        perplexities[dataset] = perplexity.item()
+    return perplexities
 
 
 if __name__ == '__main__':
@@ -248,37 +194,57 @@ if __name__ == '__main__':
        '--log_wandb', action='store_true',
        help='Whether to log to wandb.'
     )
+    parser.add_argument(
+        '--baseline', action='store_true',
+        help='Whether to test the dense baseline.'
+    )
 
     args = parser.parse_args()
 
     # init W&B logging
     if args.log_wandb:
         assert has_wandb, "wandb not installed try `pip install wandb`"
-        wandb.init(project="prune", name="OPT", config=args)
+        wandb.init(project="prune", name=args.model.split('/')[1], config=args)
 
     model = get_opt(args.model)
-    model.eval()
-
     dataloader, testloader = get_loaders(
         args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
     )
+    print(f"Model: {args.model}")
+    perplexities = {}
+    if args.baseline:
+        perplexities['dense'] = opt_eval_all(model, "dense")
 
-    if (args.sparsity or args.prunen) and not args.gmp:
-        tick = time.time()
+    if (args.sparsity or args.prunen):
+        model = get_opt(args.model)
+        model.eval()
+        # tick = time.time()
         masks = opt_sequential(model, dataloader, DEV)
-        for n, p in model.model.decoder.layers.named_parameters():
-            print(n, torch.mean((p == 0).float()))
-            # if 'fc2' in n:
-            #     break
-        print(time.time() - tick)
-        torch.save(masks, f'{args.save}/masks.pt')
+        if args.save:
+            model.save_pretrained(args.save)
+            torch.save(masks, f'{args.save}/masks.pt')
+        perplexities['SparseGPT'] = opt_eval_all(model, "SparseGPT")
+        
+    if args.gmp and (args.sparsity or args.prunen):
+        if args.prunen:
+            target_sparsity = args.prunen / args.prunem
+        else:
+            target_sparsity = args.sparsity
+        model = get_opt(args.model)
+        model.eval()
+        masks = opt_gmp(model, target_sparsity)
+        if args.save:
+            save_path = pathlib.Path(args.save).parent / f"gmp_{int(target_sparsity * 100):02d}"
+            model.save_pretrained(save_path)
+            torch.save(masks, f'{save_path}/masks.pt')
+        perplexities['GMP'] = opt_eval_all(model, "GMP")
+    
+    if args.log_wandb:
+        data = []
+        for method, vals in perplexities.items():
+            for dataset, v in vals.items():
+                data.append([dataset, method, v])
 
-    for dataset in ['wikitext2', 'ptb', 'c4']:
-        dataloader, testloader = get_loaders(
-            dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
-        )
-        print(dataset)
-        opt_eval(model, testloader, DEV, dataset, args.log_wandb)
-
-    if args.save:
-        model.save_pretrained(args.save)
+        table = wandb.Table(data=data, columns = ["dataset", "method", "perplexity"])
+        wandb.log({"Grouped_metrics" : table}) 
+        wandb.run.finish()
