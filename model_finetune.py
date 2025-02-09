@@ -155,7 +155,8 @@ def get_model_lora(model_path, scaling_factor=0.25):
 #     return model
 
     
-def main(mode, dataset, model, factor_e, factor_d, block_size, n_groups, n_blocks, shuffle, lr, lr_scale, hp_finding=False):
+def main(mode, dataset, model, factor_e, factor_d, block_size, n_groups, n_blocks, shuffle, lr, lr_scale, hp_finding_attemps=0):
+    hp_finding = hp_finding_attemps > 0
     # args = TrainArgs()
     if mode == 'dense':
         train_name = 'dense_baseline'
@@ -178,6 +179,7 @@ def main(mode, dataset, model, factor_e, factor_d, block_size, n_groups, n_block
         lora_scaling = factor_e / factor_d
     else:
         raise ValueError("mode must be 'dense', 'sparse', 'reconnect', 'oft', 'oft_approx', 'lora' or 'loha'")
+    train_name = f'{train_name}_{model}'
     
     model_name = models[model]['name']
     masked_model_path = models[model]['masked_path']
@@ -213,7 +215,7 @@ def main(mode, dataset, model, factor_e, factor_d, block_size, n_groups, n_block
         ddp_backend='nccl' if is_ddp_run else None,
         load_best_model_at_end=True if not hp_finding else False,
         optim='adamw_torch_fused',
-        report_to=None,
+        report_to="none" if hp_finding else None,
         accelerator_config={
             "split_batches": True,
         },
@@ -223,6 +225,7 @@ def main(mode, dataset, model, factor_e, factor_d, block_size, n_groups, n_block
         torch_compile=True,
         eval_on_start=True,
         learning_rate=lr,
+        # label_names=['labels'],
     )
     
     if mode == 'dense':
@@ -269,27 +272,47 @@ def main(mode, dataset, model, factor_e, factor_d, block_size, n_groups, n_block
             },
         }
     
+    # dirty trick to stop huggingface from creating multiple models
+    def singleton_get_model(func):
+        model = None
+        def wrapper(trial):
+            nonlocal model
+            if model is None:
+                model = func(trial)
+            return model
+        return wrapper
+    
     trainer = Trainer(
         model = None,
-        model_init = get_model,
+        model_init = singleton_get_model(get_model),
         args = training_args,
         train_dataset=lm_datasets['train'],
         eval_dataset=lm_datasets['validation']
     )
     
-    os.environ["WANDB_PROJECT"] = 'reconnect-finetune' if not hp_finding else 'reconnect-finetune-lr'
-    os.environ["WANDB_RUN_GROUP"] = train_name
     if hp_finding:
-        trainer.hyperparameter_search(
-            direction='minimize',
-            backend='optuna',
-            hp_space=optuna_hp_space,
-            n_trials=20,
-            study_name=train_name,
-            storage='sqlite:///db.sqlite3',
-            load_if_exists=True
-        )
+        optuna_study = optuna.create_study(storage='sqlite:///db.sqlite3', study_name=train_name, load_if_exists=True, direction='minimize')
+        sucessful_trails = optuna_study.get_trials(states=[optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED])
+        if len(sucessful_trails) < hp_finding_attemps:
+            # trial = optuna_study.ask()
+            # # trainer.train(trial=optuna_study.ask())
+            # from transformers import trainer_utils
+            # trainer.hp_search_backend = trainer_utils.HPSearchBackend.OPTUNA
+            # trainer.hp_space = optuna_hp_space
+            # trainer.compute_objective = trainer_utils.default_compute_objective
+            # trainer.train(trial=trial)
+            trainer.hyperparameter_search(
+                direction='minimize',
+                backend='optuna',
+                hp_space=optuna_hp_space,
+                n_trials=1,
+                study_name=train_name,
+                storage='sqlite:///db.sqlite3',
+                load_if_exists=True
+            )
     else:
+        os.environ["WANDB_PROJECT"] = 'reconnect-finetune' if not hp_finding else 'reconnect-finetune-lr'
+        os.environ["WANDB_RUN_GROUP"] = train_name
         trainer.train()
         # pass
 
@@ -317,7 +340,7 @@ if __name__ == '__main__':
     argparser.add_argument('--shuffle', '-s', action='store_true')
     argparser.add_argument('--lr', '-lr', type=float, default=5e-5)
     argparser.add_argument('--lr_scale', '-ls', type=float, default=30.0)
-    argparser.add_argument('--hp_finding', '-hp', action='store_true')
+    argparser.add_argument('--hp_finding_attemps', '-hp', type=int, default=0)
     args = argparser.parse_args()
     
     
@@ -325,5 +348,5 @@ if __name__ == '__main__':
         args.mode, args.dataset, args.model,
         args.param_factor_e, args.param_factor_d,
         args.block_size, args.n_groups, args.n_blocks,
-        args.shuffle, args.lr, args.lr_scale, args.hp_finding
+        args.shuffle, args.lr, args.lr_scale, args.hp_finding_attemps
         )
